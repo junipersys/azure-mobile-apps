@@ -347,6 +347,9 @@ namespace Microsoft.Datasync.Client.Offline
             var enumerable = table.GetAsyncItems(odataString);
             try
             {
+                var upserts = new List<(string id, JObject item, DateTimeOffset? updatedAt)>();
+                var deletes = new List<(string id, DateTimeOffset? updatedAt)>();
+
                 await foreach (var instance in enumerable)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -377,23 +380,39 @@ namespace Microsoft.Datasync.Client.Offline
                         throw new InvalidOperationException("Received an item for which there is a pending operation.");
                     }
                     SendItemWillBeStoredEvent(tableName, itemId, itemCount, expectedItems);
+                    var itemUpdatedAt = ServiceSerializer.GetUpdatedAt(item)?.ToUniversalTime();
 
                     if (ServiceSerializer.IsDeleted(item))
                     {
-                        await OfflineStore.DeleteAsync(tableName, new[] { itemId }, cancellationToken).ConfigureAwait(false);
+                        deletes.Add((itemId, itemUpdatedAt));
                     }
                     else
                     {
-                        await OfflineStore.UpsertAsync(tableName, new[] { item }, true, cancellationToken).ConfigureAwait(false);
+                        upserts.Add((itemId, item, itemUpdatedAt));
                     }
                     itemCount++;
-                    updatedAt = ServiceSerializer.GetUpdatedAt(item)?.ToUniversalTime();
-                    if (itemCount % options.WriteDeltaTokenInterval == 0 && updatedAt.HasValue)
+                }
+
+                if (deletes.Count > 0 || upserts.Count > 0)
+                {
+                    await OfflineStore.DeleteAsync(tableName, deletes.Select(x => x.id), cancellationToken).ConfigureAwait(false);
+                    await OfflineStore.UpsertAsync(tableName, upserts.Select(x => x.item), true, cancellationToken).ConfigureAwait(false);
+                    var updatedAts = upserts.Select(x => x.updatedAt).Concat(deletes.Select(x => x.updatedAt)).Where(x => x != null);
+                    if (updatedAts.Any())
                     {
-                        await DeltaTokenStore.SetDeltaTokenAsync(tableName, queryId, updatedAt.Value, cancellationToken).ConfigureAwait(false);
-                        updatedAt = null; // Easy way to prevent the finally block to not write twice.
+                        updatedAt = updatedAts.Select(x => x.Value).OrderByDescending(x => x).FirstOrDefault();
+
+                        if (updatedAt.HasValue)
+                        {
+                            await DeltaTokenStore.SetDeltaTokenAsync(tableName, queryId, updatedAt.Value, cancellationToken).ConfigureAwait(false);
+                            updatedAt = null; // Easy way to prevent the finally block to not write twice.
+                        }
                     }
-                    SendItemWasStoredEvent(tableName, itemId, itemCount, expectedItems);
+
+                    foreach (var (itemId, _, _) in upserts)
+                    {
+                        SendItemWasStoredEvent(tableName, itemId, itemCount, expectedItems);
+                    }
                 }
             }
             finally
